@@ -45,6 +45,7 @@
 #include "redis_pubsub.h"
 #include "redis_sortedint.h"
 #include "redis_slot.h"
+#include "redis_TS.h"
 #include "replication.h"
 #include "util.h"
 #include "storage.h"
@@ -4730,6 +4731,137 @@ class CommandScript : public Commander {
   std::string subcommand_;
 };
 
+class CommandTSAdd : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    // TSADD primary_key timestamp class_id value ttl [class_id value ttl]
+    if (args.size() < 6 || args.size() % 3 != 0) {
+      return Status(Status::RedisParseErr, errWrongNumOfArguments);
+    }
+
+    try {
+      long long timestamp = std::stoll(args[2]);
+      if (timestamp < 0) {
+        return Status(Status::RedisParseErr, errValueMustBePositive);
+      }
+      for (std::size_t i = 5; i < args.size(); i += 3) {
+        long long ttl = std::stoll(args[i]);
+        if (ttl < 0) {
+          return Status(Status::RedisParseErr, errValueMustBePositive);
+        }
+      }
+    } catch (std::invalid_argument const &ex) {
+      return Status(Status::RedisParseErr, errValueNotInterger);
+    } catch (std::out_of_range const &ex) {
+      return Status(Status::RedisParseErr, errValueMustBePositive);
+    }
+    return Commander::Parse(args);
+  }
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    Redis::TS ts_db(svr->storage_, conn->GetNamespace());
+    std::vector<TSAddSpec> tss;
+    std::string &primary_key = args_[1];
+    std::string &timestamp = args_[2];
+    // TODO timestamp optimize
+    for (size_t i = 3; i < args_.size(); i += 3) {
+      tss.emplace_back(TSAddSpec{primary_key, timestamp, args_[i], args_[i + 1],
+                                 args_[i + 2]});
+    }
+    rocksdb::Status s = ts_db.MAdd(tss);
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+    *output = Redis::SimpleString("OK");
+    return Status::OK();
+  }
+};
+
+class CommandTSRange : public Commander {
+ public:
+  Status Parse(const std::vector<std::string> &args) override {
+    // TSRANGE primary_key field fromTimestamp toTimestamp
+    // [limit num [aes|desc]]
+    std::size_t pos{};
+    try {
+      switch (args.size()) {
+        case 8:
+          if (!(args[7] == "aes" || args[7] == "desc")) {
+            return Status(Status::RedisParseErr, errInvalidSyntax);
+          }
+        case 7:
+          if (args[5] != "limit") {
+            return Status(Status::RedisParseErr, errInvalidSyntax);
+          }
+          std::stoll(args[6], &pos);
+        case 5: {
+          long long f = std::stoll(args[3], &pos);
+          if (f < 0) {
+            return Status(Status::RedisParseErr, errValueMustBePositive);
+          }
+          long long t = std::stoll(args[4], &pos);
+          if (t > 0 && t < f) {
+            return Status(Status::RedisParseErr, errValueMustBePositive);
+          }
+          break;
+        }
+        default:
+          return Status(Status::RedisParseErr, errWrongNumOfArguments);
+      }
+    } catch (std::invalid_argument const &ex) {
+      return Status(Status::RedisParseErr, errValueNotInterger);
+    } catch (std::out_of_range const &ex) {
+      return Status(Status::RedisParseErr, errValueMustBePositive);
+    }
+
+    return Commander::Parse(args);
+  }
+  Status Execute(Server *svr, Connection *conn, std::string *output) override {
+    // TSRANGE primary_key field fromTimestamp toTimestamp [limit num
+    // aes|desc]
+    Redis::TS ts_db(svr->storage_, conn->GetNamespace());
+    std::vector<TSFieldValue> ts_values;
+    rocksdb::Status s;
+    switch (args_.size()) {
+      case 8: {
+        TSRangSpec ts_rang_spec{args_[1], args_[2], args_[3], args_[4],
+                                args_[5], args_[6], args_[7]};
+        s = ts_db.Range(ts_rang_spec, &ts_values);
+        break;
+      }
+      case 7: {
+        std::string order = "aes";
+        TSRangSpec ts_rang_spec{args_[1], args_[2], args_[3], args_[4],
+                                args_[5], args_[6], order};
+        s = ts_db.Range(ts_rang_spec, &ts_values);
+        break;
+      }
+      case 5: {
+        std::string limit = "limit";
+        std::string limit_num = "2147483647";  // max int
+        std::string order = "aes";
+        TSRangSpec ts_rang_spec{args_[1], args_[2],  args_[3], args_[4],
+                                limit,    limit_num, order};
+        s = ts_db.Range(ts_rang_spec, &ts_values);
+        break;
+      }
+      default:
+        return Status(Status::RedisParseErr, errWrongNumOfArguments);
+        break;
+    }
+
+    if (!s.ok()) {
+      return Status(Status::RedisExecErr, s.ToString());
+    }
+    *output = "*" + std::to_string(ts_values.size() * 3) + CRLF;
+    for (const auto &fv : ts_values) {
+      *output += Redis::BulkString(fv.timestamp);
+      *output += Redis::BulkString(fv.field);
+      *output += Redis::BulkString(fv.value);
+    }
+    return Status::OK();
+  }
+};
+
 #define ADD_CMD(name, arity, description , first_key, last_key, key_step, fn) \
 {name, arity, description, 0, first_key, last_key, key_step, []() -> std::unique_ptr<Commander> { \
   return std::unique_ptr<Commander>(new fn()); \
@@ -4867,7 +4999,8 @@ CommandAttributes redisCommandTable[] = {
     ADD_CMD("zremrangebyrank", 4, "write", 1, 1, 1, CommandZRemRangeByRank),
     ADD_CMD("zremrangebyscore", -4, "write", 1, 1, 1, CommandZRemRangeByScore),
     ADD_CMD("zremrangebylex", 4, "write", 1, 1, 1, CommandZRemRangeByLex),
-    ADD_CMD("zrevrangebyscore", -4, "read-only", 1, 1, 1, CommandZRevRangeByScore),
+    ADD_CMD("zrevrangebyscore", -4, "read-only", 1, 1, 1,
+            CommandZRevRangeByScore),
     ADD_CMD("zrevrank", 3, "read-only", 1, 1, 1, CommandZRevRank),
     ADD_CMD("zscore", 3, "read-only", 1, 1, 1, CommandZScore),
     ADD_CMD("zmscore", -3, "read-only", 1, 1, 1, CommandZMScore),
@@ -4879,16 +5012,23 @@ CommandAttributes redisCommandTable[] = {
     ADD_CMD("geohash", -3, "read-only", 1, 1, 1, CommandGeoHash),
     ADD_CMD("geopos", -3, "read-only", 1, 1, 1, CommandGeoPos),
     ADD_CMD("georadius", -6, "write", 1, 1, 1, CommandGeoRadius),
-    ADD_CMD("georadiusbymember", -5, "write", 1, 1, 1, CommandGeoRadiusByMember),
+    ADD_CMD("georadiusbymember", -5, "write", 1, 1, 1,
+            CommandGeoRadiusByMember),
     ADD_CMD("georadius_ro", -6, "read-only", 1, 1, 1, CommandGeoRadiusReadonly),
-    ADD_CMD("georadiusbymember_ro", -5, "read-only", 1, 1, 1, CommandGeoRadiusByMemberReadonly),
+    ADD_CMD("georadiusbymember_ro", -5, "read-only", 1, 1, 1,
+            CommandGeoRadiusByMemberReadonly),
 
     ADD_CMD("publish", 3, "read-only pub-sub", 0, 0, 0, CommandPublish),
-    ADD_CMD("subscribe", -2, "read-only pub-sub no-multi no-script", 0, 0, 0, CommandSubscribe),
-    ADD_CMD("unsubscribe", -1, "read-only pub-sub no-multi no-script", 0, 0, 0, CommandUnSubscribe),
-    ADD_CMD("psubscribe", -2, "read-only pub-sub no-multi no-script", 0, 0, 0, CommandPSubscribe),
-    ADD_CMD("punsubscribe", -1, "read-only pub-sub no-multi no-script", 0, 0, 0, CommandPUnSubscribe),
-    ADD_CMD("pubsub", -2, "read-only pub-sub no-script", 0, 0, 0, CommandPubSub),
+    ADD_CMD("subscribe", -2, "read-only pub-sub no-multi no-script", 0, 0, 0,
+            CommandSubscribe),
+    ADD_CMD("unsubscribe", -1, "read-only pub-sub no-multi no-script", 0, 0, 0,
+            CommandUnSubscribe),
+    ADD_CMD("psubscribe", -2, "read-only pub-sub no-multi no-script", 0, 0, 0,
+            CommandPSubscribe),
+    ADD_CMD("punsubscribe", -1, "read-only pub-sub no-multi no-script", 0, 0, 0,
+            CommandPUnSubscribe),
+    ADD_CMD("pubsub", -2, "read-only pub-sub no-script", 0, 0, 0,
+            CommandPubSub),
 
     ADD_CMD("multi", 1, "multi", 0, 0, 0, CommandMulti),
     ADD_CMD("discard", 1, "multi", 0, 0, 0, CommandDiscard),
@@ -4900,27 +5040,41 @@ CommandAttributes redisCommandTable[] = {
     ADD_CMD("siexists", -3, "read-only", 1, 1, 1, CommandSortedintExists),
     ADD_CMD("sirange", -4, "read-only", 1, 1, 1, CommandSortedintRange),
     ADD_CMD("sirevrange", -4, "read-only", 1, 1, 1, CommandSortedintRevRange),
-    ADD_CMD("sirangebyvalue", -4, "read-only", 1, 1, 1, CommandSortedintRangeByValue),
-    ADD_CMD("sirevrangebyvalue", -4, "read-only", 1, 1, 1, CommandSortedintRevRangeByValue),
+    ADD_CMD("sirangebyvalue", -4, "read-only", 1, 1, 1,
+            CommandSortedintRangeByValue),
+    ADD_CMD("sirevrangebyvalue", -4, "read-only", 1, 1, 1,
+            CommandSortedintRevRangeByValue),
 
     ADD_CMD("cluster", -2, "cluster no-script", 0, 0, 0, CommandCluster),
     ADD_CMD("clusterx", -2, "cluster no-script", 0, 0, 0, CommandClusterX),
 
     ADD_CMD("eval", -3, "exclusive write no-script", 0, 0, 0, CommandEval),
-    ADD_CMD("evalsha", -3, "exclusive write no-script", 0, 0, 0, CommandEvalSHA),
+    ADD_CMD("evalsha", -3, "exclusive write no-script", 0, 0, 0,
+            CommandEvalSHA),
     ADD_CMD("script", -2, "exclusive no-script", 0, 0, 0, CommandScript),
 
     ADD_CMD("compact", 1, "read-only no-script", 0, 0, 0, CommandCompact),
     ADD_CMD("bgsave", 1, "read-only no-script", 0, 0, 0, CommandBGSave),
-    ADD_CMD("flushbackup", 1, "read-only no-script", 0, 0, 0, CommandFlushBackup),
-    ADD_CMD("slaveof", 3, "read-only exclusive no-script", 0, 0, 0, CommandSlaveOf),
+    ADD_CMD("flushbackup", 1, "read-only no-script", 0, 0, 0,
+            CommandFlushBackup),
+    ADD_CMD("slaveof", 3, "read-only exclusive no-script", 0, 0, 0,
+            CommandSlaveOf),
     ADD_CMD("stats", 1, "read-only", 0, 0, 0, CommandStats),
 
-    ADD_CMD("replconf", -3, "read-only replication no-script", 0, 0, 0, CommandReplConf),
-    ADD_CMD("psync", -2, "read-only replication no-multi no-script", 0, 0, 0, CommandPSync),
-    ADD_CMD("_fetch_meta", 1, "read-only replication no-multi no-script", 0, 0, 0, CommandFetchMeta),
-    ADD_CMD("_fetch_file", 2, "read-only replication no-multi no-script", 0, 0, 0, CommandFetchFile),
-    ADD_CMD("_db_name", 1, "read-only replication no-multi", 0, 0, 0, CommandDBName),
+    ADD_CMD("replconf", -3, "read-only replication no-script", 0, 0, 0,
+            CommandReplConf),
+    ADD_CMD("psync", -2, "read-only replication no-multi no-script", 0, 0, 0,
+            CommandPSync),
+    ADD_CMD("_fetch_meta", 1, "read-only replication no-multi no-script", 0, 0,
+            0, CommandFetchMeta),
+    ADD_CMD("_fetch_file", 2, "read-only replication no-multi no-script", 0, 0,
+            0, CommandFetchFile),
+    ADD_CMD("_db_name", 1, "read-only replication no-multi", 0, 0, 0,
+            CommandDBName),
+
+    // TS
+    ADD_CMD("tsmadd", -6, "write", 1, -1, 3, CommandTSAdd),
+    ADD_CMD("tsrange", -5, "write", 1, -1, 3, CommandTSRange),
 };
 
 // Command table after rename-command directive
